@@ -3,7 +3,7 @@ import uuid
 import pandas as pd
 from numpy import ndarray
 
-from etl.common.s3_service import S3Service
+from s3_service import S3Service
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance, VectorParams, PointStruct
 from sentence_transformers import SentenceTransformer
@@ -55,7 +55,7 @@ def load_property_data(feed='cws-bright'):
     return df
 
 def main():
-    #df = load_property_data()
+    df = load_property_data()
 
     qd_client = QdrantClient(url="http://localhost:6333")
 
@@ -81,27 +81,27 @@ def main():
         'interior_features': 'Interior features',
         'pool_features': 'Pool features'
     }
-    # for index, row in df.iterrows():
-    #     text_data = []
-    #     for key, feature in features.items():
-    #         value = row[key] if row[key] is not None else None
-    #         str_value = None
-    #         is_list = isinstance(value, ndarray)
-    #         if (is_list or pd.notnull(value)):
-    #             if is_list :
-    #                 value = value.tolist()
-    #             str_value = ", ".join(value)
-    #         final_value = f"{feature}: {str_value}"
-    #         text_data.append(final_value)
-    #     text = ";".join(text_data)
-    #     embeddings = model.encode(text, batch_size=32, show_progress_bar=True)
-    #     points.append(PointStruct(id=str(uuid.uuid5(uuid.NAMESPACE_DNS, row['lp_listing_id'])), vector=embeddings.tolist(), payload={"text": text}))
-    #
-    # print('==== start inserting points ======')
-    # path_pages = [points[i:i + 500]
-    #               for i in range(0, len(points), 500)]
-    # for page in path_pages:
-    #     qd_client.upsert(collection_name=collection_name, points=page)
+    for index, row in df.iterrows():
+        text_data = []
+        for key, feature in features.items():
+            value = row[key] if row[key] is not None else None
+            str_value = None
+            is_list = isinstance(value, ndarray)
+            if (is_list or pd.notnull(value)):
+                if is_list :
+                    value = value.tolist()
+                str_value = ", ".join(value)
+            final_value = f"{feature}: {str_value}"
+            text_data.append(final_value)
+        text = ";".join(text_data)
+        embeddings = model.encode(text, batch_size=32, show_progress_bar=True)
+        points.append(PointStruct(id=str(uuid.uuid5(uuid.NAMESPACE_DNS, row['lp_listing_id'])), vector=embeddings.tolist(), payload={"text": text}))
+
+    print('==== start inserting points ======')
+    path_pages = [points[i:i + 500]
+                  for i in range(0, len(points), 500)]
+    for page in path_pages:
+        qd_client.upsert(collection_name=collection_name, points=page)
 
     query_text = "Listings with in-ground pool"
     query_embedding = model.encode(query_text).tolist()
