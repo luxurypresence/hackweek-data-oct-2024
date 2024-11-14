@@ -107,7 +107,7 @@ class FeatureFlagCache:
                 security_features: {security_features}
                 Building Features: {building_features}
 
-                Return only 'true' or 'false'.
+                Return only 'True' or 'False'.
                 """
             ),
             # FeatureFlag.PETS_ALLOWED: FeatureConfig(

@@ -4,58 +4,95 @@ import pandas as pd
 from numpy import ndarray
 
 from s3_service import S3Service
+from chatgpt import CGPClient
+from property_feature_flag_semantic_cache import FeatureFlagCache, FeatureFlag
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance, VectorParams, PointStruct
 from sentence_transformers import SentenceTransformer
 
 
+class DataScan:
 
-def load_property_data(feed='cws-bright'):
-    sql = \
-        f" WITH b as (" \
-        f" 	SELECT p.lp_provider_id," \
-        f" 		p.lp_listing_id," \
-        f" 		CAST(p.event_modification_timestamp as timestamp) event_modification_timestamp" \
-        f" 	FROM property p" \
-        f" 		INNER JOIN (" \
-        f" 			SELECT lp_provider_id," \
-        f" 				lp_listing_id," \
-        f" 				MAX(event_modification_timestamp) as max_event_ts" \
-        f" 			FROM property" \
-        f" 			GROUP BY lp_provider_id," \
-        f" 				lp_listing_id" \
-        f" 		) pp ON pp.lp_provider_id = p.lp_provider_id" \
-        f" 		AND pp.lp_listing_id = p.lp_listing_id" \
-        f" 		AND pp.max_event_ts = p.event_modification_timestamp" \
-        f" 	WHERE pp.lp_provider_id = '{feed}'" \
-        f" 		AND pp.max_event_ts > CAST('2024-04-10 00:00:00' as timestamp)" \
-        f" 		AND p.lp_listing_status = 'ACTIVE'" \
-        f"      AND list_price is not null AND list_price >= 350000" \
-        f"      AND property_type = 'Residential'" \
-        f" )" \
-        f" SELECT a.lp_provider_id, " \
-        f"           a.listing_id," \
-        f"           a.lp_listing_id," \
-        f"           a.lp_listing_status," \
-        f"           CAST(a.event_modification_timestamp as timestamp) event_modification_timestamp," \
-        f"           a.interior_features," \
-        f"           a.exterior_features," \
-        f"           a.lot_features," \
-        f"           a.community_features,"\
-        f"           a.pool_features," \
-        f"           a.building_features" \
-        f" FROM property a" \
-        f" 	JOIN b ON a.lp_provider_id = b.lp_provider_id" \
-        f" 	and a.lp_listing_id = b.lp_listing_id" \
-        f" 	and a.event_modification_timestamp = b.event_modification_timestamp" \
-        f" LIMIT 15000"
+    def __init__(self, feed_name, s3_service=S3Service()):
+        self.sql_process_batch_limit = 20000
+        self.sql_process_current_offset = 0
+        self.s3_service = s3_service
+        self.feed_name = feed_name
 
-    s3_service = S3Service()
-    df = s3_service.read_athena(sql, 'lp_data_model_production', 's3://qa-extract-s3-bucket-production/hackweek/')
-    return df
+    def prepare_sql(self, feed='cws-bright'):
+        sql = \
+            f" WITH b as (" \
+            f" 	SELECT p.lp_provider_id," \
+            f" 		p.lp_listing_id," \
+            f" 		CAST(p.event_modification_timestamp as timestamp) event_modification_timestamp" \
+            f" 	FROM property p" \
+            f" 		INNER JOIN (" \
+            f" 			SELECT lp_provider_id," \
+            f" 				lp_listing_id," \
+            f" 				MAX(event_modification_timestamp) as max_event_ts" \
+            f" 			FROM property" \
+            f" 			GROUP BY lp_provider_id," \
+            f" 				lp_listing_id" \
+            f" 		) pp ON pp.lp_provider_id = p.lp_provider_id" \
+            f" 		AND pp.lp_listing_id = p.lp_listing_id" \
+            f" 		AND pp.max_event_ts = p.event_modification_timestamp" \
+            f" 	WHERE pp.lp_provider_id = '{self.feed_name}'" \
+            f" 		AND pp.max_event_ts > CAST('2024-04-10 00:00:00' as timestamp)" \
+            f" 		AND p.lp_listing_status = 'ACTIVE'" \
+            f" )" \
+            f" SELECT a.lp_provider_id, " \
+            f"           a.listing_id," \
+            f"           a.lp_listing_id," \
+            f"           a.lp_listing_status," \
+            f"           CAST(a.event_modification_timestamp as timestamp) event_modification_timestamp," \
+            f"           CAST(a.lp_processed_timestamp as timestamp) lp_processed_timestamp," \
+            f"           a.interior_features," \
+            f"           a.exterior_features," \
+            f"           a.lot_features," \
+            f"           a.community_features,"\
+            f"           a.pool_features," \
+            f"           a.security_features," \
+            f"           a.building_features" \
+            f" FROM property a" \
+            f" 	JOIN b ON a.lp_provider_id = b.lp_provider_id" \
+            f" 	and a.lp_listing_id = b.lp_listing_id" \
+            f" 	and a.event_modification_timestamp = b.event_modification_timestamp" \
+            f" ORDER BY a.lp_listing_id" \
+            f" OFFSET {self.sql_process_current_offset}" \
+            f" LIMIT {self.sql_process_batch_limit} "
+        return sql
+
+    def load_property_data(self):
+        sql = self.prepare_sql()
+        df = self.s3_service.read_athena(sql, 'lp_data_model_production', 's3://qa-extract-s3-bucket-production/hackweek/')
+        df = df.sort_values(['event_modification_timestamp', 'lp_processed_timestamp']).drop_duplicates(
+            subset=['lp_provider_id', 'listing_id'],
+            keep='last')
+        self.sql_process_current_offset += self.sql_process_batch_limit
+        return df.to_dict('records')
 
 def main():
-    df = load_property_data()
+    data_scan = DataScan('cws-bright')
+    ff_cache = FeatureFlagCache(llm_client=CGPClient())
+    raw_list = data_scan.load_property_data()
+    while len(raw_list) > 0:
+        listings_processed = {}
+        for listing in raw_list:
+            listings_processed[listing['lp_listing_id']] = {}
+            for feature in FeatureFlag:
+                feat_value_tuple = ff_cache.get_feature_value(listing, feature)
+                print(f"Feature {feature} is {feat_value_tuple[0]} for listing {listing['lp_listing_id']}."
+                      f" Cache hit is {feat_value_tuple[1]}, accuracy {feat_value_tuple[2]}")
+                listings_processed[listing['lp_listing_id']][feature] = feat_value_tuple[0]
+                # TODO: sore the processed listings table
+            print(f"Listing processed {listings_processed[listing['lp_listing_id']]}")
+        print(listings_processed)
+        # next data row
+        raw_list = data_scan.load_property_data()
+
+
+def sample():
+    #df = load_property_data()
 
     qd_client = QdrantClient(url="http://localhost:6333")
 
