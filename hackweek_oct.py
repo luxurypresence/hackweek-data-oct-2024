@@ -72,7 +72,7 @@ class DataScan:
         return df.to_dict('records')
 
 def main():
-    data_scan = DataScan('cws-bright')
+    data_scan = DataScan('trestle-rebny')
     ff_cache = FeatureFlagCache(llm_client=CGPClient())
     raw_list = data_scan.load_property_data()
     while len(raw_list) > 0:

@@ -100,7 +100,7 @@ class FeatureFlagCache:
         return {
             FeatureFlag.HAS_DOORMAN: FeatureConfig(
                 relevant_fields=["security_features", "building_features"],
-                similarity_threshold=0.85,  # Adjusted threshold for new embedding model
+                similarity_threshold=0.95,  # Adjusted threshold for new embedding model
                 prompt_template="""
                 Based on these property details, determine if there is a doorman:
 
