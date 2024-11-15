@@ -102,7 +102,7 @@ class FeatureFlagCache:
                 relevant_fields=["security_features", "building_features"],
                 similarity_threshold=0.95,  # Adjusted threshold for new embedding model
                 prompt_template="""
-                Based on these property details, determine if there is a doorman:
+                Based on these property details, determine if there is a doorman. Concierge is considered a doorman:
 
                 security_features: {security_features}
                 Building Features: {building_features}
