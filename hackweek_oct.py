@@ -10,16 +10,29 @@ from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance, VectorParams, PointStruct
 from sentence_transformers import SentenceTransformer
 
+#staging
+PROPERTY_DB = 'lp_data_model_stage'
+S3_OUTPUT = 's3://lp-datalakehouse-stage/hackweek/'
+
+#production
+# PROPERTY_DB = 'lp_data_model_production'
+# S3_OUTPUT = 's3://qa-extract-s3-bucket-production/hackweek/'
+
+#set environment variables
+import os
+os.environ['AWS_PROFILE'] = 'newetlstaging'
+os.environ['AWS_DEFAULT_REGION'] = 'us-east-1'
 
 class DataScan:
 
     def __init__(self, feed_name, s3_service=S3Service()):
-        self.sql_process_batch_limit = 20000
+        self.sql_process_batch_limit = 500
         self.sql_process_current_offset = 0
         self.s3_service = s3_service
         self.feed_name = feed_name
 
-    def prepare_sql(self, feed='cws-bright'):
+    def prepare_sql(self):
+        additional_filter_for_testing = 'and (cardinality(a.security_features ) > 0 or cardinality(a.building_features) > 0)'
         sql = \
             f" WITH b as (" \
             f" 	SELECT p.lp_provider_id," \
@@ -57,39 +70,137 @@ class DataScan:
             f" 	JOIN b ON a.lp_provider_id = b.lp_provider_id" \
             f" 	and a.lp_listing_id = b.lp_listing_id" \
             f" 	and a.event_modification_timestamp = b.event_modification_timestamp" \
+            f"  {additional_filter_for_testing}" \
             f" ORDER BY a.lp_listing_id" \
             f" OFFSET {self.sql_process_current_offset}" \
             f" LIMIT {self.sql_process_batch_limit} "
         return sql
+    
+    def prepare_sql_custom_listings(self, custom_listings):
+        custom_listings_str = ', '.join([f"'{listing}'" for listing in custom_listings])
+        sql = \
+            f" SELECT a.lp_provider_id, " \
+            f"           a.listing_id," \
+            f"           a.lp_listing_id," \
+            f"           a.lp_listing_status," \
+            f"           CAST(a.event_modification_timestamp as timestamp) event_modification_timestamp," \
+            f"           CAST(a.lp_processed_timestamp as timestamp) lp_processed_timestamp," \
+            f"           a.interior_features," \
+            f"           a.exterior_features," \
+            f"           a.lot_features," \
+            f"           a.community_features,"\
+            f"           a.pool_features," \
+            f"           a.security_features," \
+            f"           a.building_features" \
+            f" FROM property a" \
+            f" 	WHERE a.lp_provider_id = '{self.feed_name}'" \
+            f" 		AND a.listing_id in ({custom_listings_str})"
+            
+        return sql
 
     def load_property_data(self):
         sql = self.prepare_sql()
-        df = self.s3_service.read_athena(sql, 'lp_data_model_production', 's3://qa-extract-s3-bucket-production/hackweek/')
+        # sql = self.prepare_sql_custom_listings(['RPLU-33423020830', 'RPLU-33423096980'])
+        df = self.s3_service.read_athena(sql, PROPERTY_DB, S3_OUTPUT)
         df = df.sort_values(['event_modification_timestamp', 'lp_processed_timestamp']).drop_duplicates(
             subset=['lp_provider_id', 'listing_id'],
             keep='last')
         self.sql_process_current_offset += self.sql_process_batch_limit
         return df.to_dict('records')
 
+class DataLoadService:
+    def __init__(self, s3_bucket, table_name, target_athena_database, s3_service=S3Service()):
+        self.s3_bucket = s3_bucket
+        self.table_name = table_name
+        self.target_athena_database = target_athena_database
+        self.s3_service = s3_service
+    
+    def insert_into_iceberg_table(self, df: pd.DataFrame, table_name: str, partition_cols: list = None) -> None:
+        try:
+            if df.empty:
+                print(f"No records to insert into {table_name} table")
+                return
+            print(f"Inserting {df.shape[0]} records into {table_name} table")
+            #check if table exists
+            if not self.s3_service.check_db_table_exists(
+                    database=self.target_athena_database,
+                    table_name=table_name
+            ):
+                raise Exception(f"Table {table_name} does not exist")
+            temp_path = f's3://{self.s3_bucket}/warehouse/{self.table_name}/temp/{str(uuid.uuid4())}'
+
+            #set mode to overwrite
+            self.s3_service.wr_client.athena.to_iceberg(
+                df=df,
+                partition_cols=partition_cols,
+                database=self.target_athena_database,
+                table=table_name,
+                temp_path=temp_path,
+                workgroup='primary',
+                mode='overwrite'
+            )
+            print(f"Successfully inserted {df.shape[0]} records into {table_name} table")
+        except Exception as ex:
+            print(f"Error while inserting into {table_name} table: {ex}")
+            raise ex
+
+
 def main():
-    data_scan = DataScan('cws-bright')
-    ff_cache = FeatureFlagCache(llm_client=CGPClient())
+    feed='trestle-rebny'
+    data_scan = DataScan(feed)
+    qdrant_client = QdrantClient(
+        url="https://3d4cf461-fb47-40ed-81be-2630ab5ac214.us-east4-0.gcp.cloud.qdrant.io:6333", 
+        api_key='add your api key here',
+        )
+    
+    data_load_service = DataLoadService(
+        s3_bucket='lp-datalakehouse-stage',
+        table_name='property_feature_flags',
+        target_athena_database='lp_data_model_stage'
+    )
+
+    ff_cache = FeatureFlagCache(llm_client=CGPClient(), qdrant_client=qdrant_client)
     raw_list = data_scan.load_property_data()
+    run_once = True
     while len(raw_list) > 0:
         listings_processed = {}
+
+        #create dataframe to store the data so that we can upload it to property_feature_flags iceberg table later
+        property_df = pd.DataFrame(columns=['lp_provider_id', 'lp_listing_id', 'lp_custom_filter_tags'])
+
         for listing in raw_list:
             listings_processed[listing['lp_listing_id']] = {}
+            lp_custom_filter_tags = []
             for feature in FeatureFlag:
                 feat_value_tuple = ff_cache.get_feature_value(listing, feature)
                 print(f"Feature {feature} is {feat_value_tuple[0]} for listing {listing['lp_listing_id']}."
                       f" Cache hit is {feat_value_tuple[1]}, accuracy {feat_value_tuple[2]}")
                 listings_processed[listing['lp_listing_id']][feature] = feat_value_tuple[0]
-                # TODO: sore the processed listings table
+                if feat_value_tuple[0]:
+                    lp_custom_filter_tags.append(feature.value)
+
+            #add the listing to the dataframe using concat
+            if len(lp_custom_filter_tags) > 0:
+                property_df = pd.concat([property_df, pd.DataFrame({
+                    'lp_provider_id': [listing['lp_provider_id']],
+                    'lp_listing_id': [listing['lp_listing_id']],
+                    'lp_custom_filter_tags': [lp_custom_filter_tags]
+                })])
+                
             print(f"Listing processed {listings_processed[listing['lp_listing_id']]}")
+
+        #upload the data to iceberg table
+        data_load_service.insert_into_iceberg_table(property_df, 'property_feature_flags', ['lp_provider_id'])
+
         print(listings_processed)
+
+        if run_once:
+            break
         # next data row
         raw_list = data_scan.load_property_data()
 
+    #print cache stats
+    print(ff_cache.cache_stats)
 
 def sample():
     #df = load_property_data()
